@@ -1,126 +1,102 @@
-# Claude Tools MCP Server
+# rbash-mcp
 
-An MCP (Model Context Protocol) server that exposes Claude Code's file and shell manipulation tools over HTTP, allowing any MCP client to use these tools remotely.
+MCP server that mirrors Claude Code's native `Bash` / `BashOutput` / `KillShell` tools (plus `Read` / `Write` / `Edit` / `Glob` / `Grep`) but runs **inside an incus guest VM**. Commands travel as JSON argv over MCP, dodging the quoting/escaping pain of the built-in Bash tool for commands targeting the guest.
 
-## Features
-
-This server provides the following tools:
-
-- **bash**: Execute shell commands with timeout support and background execution
-- **bash_output**: Retrieve output from background shell processes
-- **kill_shell**: Terminate background shell processes
-- **read**: Read files with line offset/limit support
-- **write**: Write files to disk
-- **edit**: Perform exact string replacements in files
-- **glob**: Find files using glob patterns
-- **grep**: Search file contents using ripgrep (regex support, multiple output modes)
-
-## Installation
-
-### From Source
-
-```bash
-go build -o claude-tools-mcp ./cmd/claude-tools-mcp
-```
-
-### With Docker
-
-```bash
-docker build -t claude-tools-mcp .
-docker run -p 8080:8080 claude-tools-mcp
-```
-
-#### Docker Build Optimization
-
-The Docker image uses a pre-built runtime base image (`Dockerfile.runtime`) that contains all development tools and dependencies. This runtime image is automatically built and published to GitHub Container Registry (GHCR) whenever `Dockerfile.runtime` or the workflow file changes.
-
-**Benefits:**
-- Significantly faster builds (only compiles Go binary, not installing all tools)
-- Consistent runtime environment across deployments
-
-**Building the runtime image locally:**
-```bash
-# Build the runtime base image
-docker build -f Dockerfile.runtime -t claude-tools-runtime .
-
-# Build the main image using local runtime
-docker build -t claude-tools-mcp .
-```
-
-The published runtime image is available at: `ghcr.io/mathematic-inc/claude-tools-mcp-runtime:latest`
-
-## Usage
-
-### Starting the Server
-
-```bash
-# Default (localhost:8080)
-./claude-tools-mcp
-
-# Custom address
-./claude-tools-mcp --addr localhost:9000
-```
-
-### With Docker
-
-```bash
-# Default port (8080)
-docker run -p 8080:8080 claude-tools-mcp
-
-# Custom port
-docker run -e PORT=9000 -p 9000:9000 claude-tools-mcp
-```
-
-### Configuration
-
-The server runs in stateless mode, allowing each HTTP request to be handled independently. This enables horizontal scaling and simpler deployment.
-
-### Security Features
-
-- **Timeout protection**: Prevents slowloris attacks with ReadHeaderTimeout and IdleTimeout
-- **Graceful shutdown**: Responds to SIGINT/SIGTERM, allowing in-flight requests to complete
-- **Path validation**: Rejects relative paths to prevent directory traversal
-- **File size limits**: 10MB max file size, ~100k token max output
-- **Result limits**: Maximum 1000 lines for grep/glob results
+Emits `claude/channel` exit-event pushes so Claude learns about backgrounded task completions between turns.
 
 ## Architecture
 
-The server uses the [MCP Go SDK](https://github.com/modelcontextprotocol/go-sdk) to expose tools over HTTP. All tools are stateless except for:
-
-- **File modification tracking**: Detects when files are edited externally
-- **Background shell management**: Tracks long-running bash processes
-
-See [CLAUDE.md](./CLAUDE.md) for detailed architecture documentation.
-
-## Development
-
-### Running Tests
-
-```bash
-# All tests
-go test ./...
-
-# Specific package
-go test ./internal/tools
-
-# Specific test
-go test -run TestFunctionName ./internal/tools
+```
+┌──────────────────────┐          ┌──────────────────────────┐
+│ Host                 │          │ Incus guest              │
+│                      │          │                          │
+│ Claude Code          │          │ rbash-mcp daemon         │
+│   │                  │          │   - MCP JSON-RPC over    │
+│   │ stdio            │          │     unix socket          │
+│   ▼                  │          │   - per-call bash -c     │
+│ rbash-shim           │◄────────►│   - shell registry       │
+│ (stdio ↔ socket)     │  unix    │   - file tool set        │
+└──────────────────────┘  socket  └──────────────────────────┘
+                          via incus proxy device
 ```
 
-### Dependencies
+## Build
 
-- Go 1.25.1+
-- [MCP Go SDK](https://github.com/modelcontextprotocol/go-sdk)
-- [Cobra](https://github.com/spf13/cobra) for CLI
-- [mimetype](https://github.com/gabriel-vasile/mimetype) for file type detection
-- ripgrep (`rg`) must be installed for the grep tool
+```bash
+go build -o bin/rbash-mcp ./cmd/rbash-mcp
+go build -o bin/rbash-shim ./cmd/rbash-shim
+```
 
-## Repository
+## Install (guest)
 
-[github.com/mathematic-inc/claude-tools-mcp](https://github.com/mathematic-inc/claude-tools-mcp)
+1. Copy `bin/rbash-mcp` into the guest (e.g. `/usr/local/bin/rbash-mcp`).
+2. Install the systemd unit from `deploy/systemd/rbash-mcp.service`.
+3. `systemctl enable --now rbash-mcp`.
+
+The daemon listens on `/run/rbash.sock` inside the guest by default.
+
+## Install (host)
+
+1. Copy `bin/rbash-shim` onto the host (e.g. `~/.local/bin/rbash-shim`).
+2. Configure an incus proxy device that forwards the host-side socket to the guest-side socket:
+   ```
+   incus config device add <guest> rbash-sock proxy \
+     listen=unix:/run/rbash.sock \
+     connect=unix:/run/rbash.sock
+   ```
+3. Add rbash to Claude Code's MCP config:
+   ```json
+   {
+     "mcpServers": {
+       "rbash": {
+         "command": "/home/you/.local/bin/rbash-shim"
+       }
+     }
+   }
+   ```
+   Or pass a non-default socket path:
+   ```json
+   {
+     "mcpServers": {
+       "rbash": {
+         "command": "/home/you/.local/bin/rbash-shim",
+         "args": ["/run/rbash.sock"]
+       }
+     }
+   }
+   ```
+
+## Launch
+
+To receive `claude/channel` exit-event pushes, Claude Code must be launched with the development-channels flag during the research preview:
+
+```bash
+claude --dangerously-load-development-channels server:rbash
+```
+
+Without the flag, tools work normally but exit-event pushes are dropped by Claude Code.
+
+## Tools
+
+| Name | Purpose |
+|---|---|
+| `Bash` | Run a command on the guest. `run_in_background: true` returns a `backgroundTaskId`. |
+| `BashOutput` | Retrieve output from a background task by `task_id`. `block: true` (default) waits for completion. |
+| `KillShell` | Terminate a running background task. Accepts `task_id` or deprecated `shell_id`. |
+| `ListShells` | List all background tasks with status. |
+| `Read` / `Write` / `Edit` / `Glob` / `Grep` | File tools scoped to the **guest** filesystem. |
+
+All tools surface to Claude as `mcp__rbash__<Name>`.
+
+## Socket path resolution
+
+Both `rbash-mcp` (daemon) and `rbash-shim` (host bridge) resolve the socket path in this order:
+
+1. CLI arg (positional or `--socket=<path>`)
+2. `$RBASH_SOCKET` env var
+3. `$XDG_RUNTIME_DIR/rbash.sock`
+4. `/run/rbash.sock`
 
 ## License
 
-Apache-2.0 License. Copyright (c) Mathematic Inc. See [LICENSE](./LICENSE) for details.
-
-> This project is free and open-source work by a 501(c)(3) non-profit. If you find it useful, please consider [donating](https://github.com/sponsors/mathematic-inc).
+Apache-2.0. Based on [`mathematic-inc/claude-tools-mcp`](https://github.com/mathematic-inc/claude-tools-mcp); see `LICENSE`.

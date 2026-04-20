@@ -1,6 +1,7 @@
 package tools
 
 import (
+	"crypto/rand"
 	"sync"
 	"time"
 )
@@ -16,19 +17,16 @@ type State struct {
 	// used to detect when file content may have changed between operations.
 	ReadFiles map[string]time.Time
 
-	// BackgroundShells maps shell IDs to their corresponding BackgroundShell
+	// BackgroundShells maps task IDs to their corresponding BackgroundShell
 	// structs, allowing callers to monitor running processes and retrieve output.
 	BackgroundShells map[string]*BackgroundShell
 
-	// NextShellID is a monotonically increasing counter used to generate unique
-	// shell IDs (e.g., "shell_1", "shell_2"). Must be incremented atomically
-	// when protected by Mu.Lock() to ensure IDs remain globally unique.
-	NextShellID int
+	// OnTaskExit is invoked when a backgrounded shell exits. Wired by the
+	// main entrypoint to emit `notifications/claude/channel` push events.
+	// Nil is safe; the monitoring goroutine checks before calling.
+	OnTaskExit func(shell *BackgroundShell)
 }
 
-// globalState is the singleton instance of State for the entire tools package.
-// It is initialized once at package load time and accessed via GetState() to
-// provide a consistent entry point for all state management operations.
 var globalState *State
 
 func init() {
@@ -39,11 +37,25 @@ func NewState() *State {
 	return &State{
 		ReadFiles:        make(map[string]time.Time),
 		BackgroundShells: make(map[string]*BackgroundShell),
-		NextShellID:      1,
 	}
 }
 
 // GetState returns the global State singleton for the tools package.
 func GetState() *State {
 	return globalState
+}
+
+// generateTaskID returns a new `b` + 8 random alphanumeric-lowercase task
+// identifier, matching Claude Code's native `bXXXXXXXX` background-task ID
+// format so the model's training priors apply uniformly.
+func generateTaskID() string {
+	const alphabet = "0123456789abcdefghijklmnopqrstuvwxyz"
+	var buf [8]byte
+	_, _ = rand.Read(buf[:])
+	out := make([]byte, 0, 9)
+	out = append(out, 'b')
+	for _, b := range buf {
+		out = append(out, alphabet[int(b)%len(alphabet)])
+	}
+	return string(out)
 }

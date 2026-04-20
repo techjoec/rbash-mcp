@@ -1,0 +1,34 @@
+version: "2"
+
+linters:
+  default: none
+  enable:
+    - errcheck
+    - govet
+    - ineffassign
+    - staticcheck
+    - unused
+  settings:
+    errcheck:
+      # Close() on already-errored sockets/files is idiomatic-ignore.
+      exclude-functions:
+        - (net.Listener).Close
+        - (net.Conn).Close
+        - (*os.File).Close
+        - (io.Closer).Close
+    staticcheck:
+      checks:
+        - all
+        # ST1003: identifier stutter — fine in small internal packages.
+        - "-ST1003"
+        # ST1000: every file in a package must have a comment — we have
+        # one doc.go-style comment in cmd/ mains; skip on internal pkgs.
+        - "-ST1000"
+        # ST1005: error strings shouldn't end with punctuation — we
+        # intentionally mirror Claude Code native error prose.
+        - "-ST1005"
+
+formatters:
+  enable:
+    - gofmt
+    - goimports

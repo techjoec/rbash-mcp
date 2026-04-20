@@ -9,108 +9,89 @@ import (
 	sdk "github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
-type shellInfo struct {
-	ID          string `json:"id"`
-	Description string `json:"description"`
+type listShellEntry struct {
+	TaskID      string `json:"task_id"`
+	TaskType    string `json:"task_type"`
+	Description string `json:"description,omitempty"`
+	Command     string `json:"command,omitempty"`
 	Status      string `json:"status"`
-	startTime   int64  // Unix timestamp for sorting (not exported)
+	StartTime   int64  `json:"start_time_unix"`
 }
 
-type listShellsResult struct {
-	Shells []shellInfo `json:"shells"`
-	Count  int         `json:"count"`
+type ListShellsResult struct {
+	Tasks []listShellEntry `json:"tasks"`
+	Count int              `json:"count"`
 }
 
-func (s *State) executeListShells(ctx context.Context) (string, error) {
+func (s *State) executeListShells(ctx context.Context) (string, *ListShellsResult, error) {
 	s.Mu.RLock()
 	defer s.Mu.RUnlock()
 
 	if len(s.BackgroundShells) == 0 {
-		return "No background shells are currently running.", nil
+		empty := &ListShellsResult{Tasks: []listShellEntry{}, Count: 0}
+		return "No background shells are currently running.", empty, nil
 	}
 
-	shells := make([]shellInfo, 0, len(s.BackgroundShells))
-
+	entries := make([]listShellEntry, 0, len(s.BackgroundShells))
 	for _, shell := range s.BackgroundShells {
-		// Determine status without blocking
-		var status string
+		status := "running"
 		select {
 		case <-shell.Done:
-			if shell.ExitCode != 0 {
+			if shell.Killed {
+				status = "killed"
+			} else if shell.ExitCode != 0 {
 				status = "failed"
 			} else {
 				status = "completed"
 			}
 		default:
-			status = "running"
 		}
-
-		info := shellInfo{
-			ID:          shell.ID,
+		entries = append(entries, listShellEntry{
+			TaskID:      shell.ID,
+			TaskType:    "local_bash",
 			Description: shell.Description,
+			Command:     shell.Command,
 			Status:      status,
-			startTime:   shell.StartTime.Unix(),
-		}
-		shells = append(shells, info)
+			StartTime:   shell.StartTime.Unix(),
+		})
 	}
 
-	// Sort shells by status (running > failed > completed), then by creation time
-	sort.Slice(shells, func(i, j int) bool {
-		// Define status priority (lower number = higher priority)
-		statusPriority := map[string]int{
-			"running":   0,
-			"failed":    1,
-			"completed": 2,
+	priority := map[string]int{"running": 0, "failed": 1, "killed": 2, "completed": 3}
+	sort.Slice(entries, func(i, j int) bool {
+		if priority[entries[i].Status] != priority[entries[j].Status] {
+			return priority[entries[i].Status] < priority[entries[j].Status]
 		}
-
-		priorityI := statusPriority[shells[i].Status]
-		priorityJ := statusPriority[shells[j].Status]
-
-		// First sort by status priority
-		if priorityI != priorityJ {
-			return priorityI < priorityJ
-		}
-
-		// Then sort by creation time (oldest first)
-		return shells[i].startTime < shells[j].startTime
+		return entries[i].StartTime < entries[j].StartTime
 	})
 
-	result := listShellsResult{
-		Shells: shells,
-		Count:  len(shells),
-	}
-
-	jsonBytes, err := json.MarshalIndent(result, "", "  ")
+	out := &ListShellsResult{Tasks: entries, Count: len(entries)}
+	jsonBytes, err := json.MarshalIndent(out, "", "  ")
 	if err != nil {
-		return "", fmt.Errorf("Failed to format shell list: %s", err)
+		return "", nil, fmt.Errorf("Failed to format shell list: %s", err)
 	}
-
-	return string(jsonBytes), nil
+	return string(jsonBytes), out, nil
 }
 
 var ListShellsTool = sdk.Tool{
-	Name:        "list_shells",
-	Description: "- Lists all background bash shells with their current status\n- Shows shell ID, description, and status (running/completed/failed)\n- Use this tool to see what background shells are active and check their status\n- Useful for tracking long-running operations before fetching their output with bash_output",
+	Name:        "ListShells",
+	Description: listShellsDescription,
 }
 
-type ListShellsInput struct {
-	// No input parameters needed
-}
+const listShellsDescription = `- Lists all background shells on the incus guest VM with their current status
+- Shows task_id, description, command, and status (running/completed/failed/killed)
+- Use this tool to see what background shells are active and check their status
+- Useful for tracking long-running operations before fetching output with BashOutput`
 
-type ListShellsOutput struct {
-	Result string `json:"result"`
-}
+type ListShellsInput struct{}
 
 func ListShells(ctx context.Context, req *sdk.CallToolRequest, args ListShellsInput) (*sdk.CallToolResult, any, error) {
-	server := GetState()
-	result, err := server.executeListShells(ctx)
+	state := GetState()
+	text, out, err := state.executeListShells(ctx)
 	if err != nil {
 		return nil, nil, err
 	}
-
-	output := &ListShellsOutput{Result: result}
 	return &sdk.CallToolResult{
-		Content:           []sdk.Content{&sdk.TextContent{Text: result}},
-		StructuredContent: output,
-	}, output, nil
+		Content:           []sdk.Content{&sdk.TextContent{Text: text}},
+		StructuredContent: out,
+	}, out, nil
 }

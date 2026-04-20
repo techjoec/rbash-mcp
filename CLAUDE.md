@@ -1,141 +1,63 @@
-# CLAUDE.md
+# CLAUDE.md — rbash-mcp
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+Context for Claude Code sessions on this repo.
 
-## Project Overview
+## What this is
 
-This is an MCP (Model Context Protocol) server that exposes Claude Code's file and shell tools over HTTP, allowing other MCP clients to use these tools remotely. The server runs in stateless mode for horizontal scaling.
+An MCP server that mirrors Claude Code's native `Bash` / `BashOutput` / `KillShell` tools (plus `Read` / `Write` / `Edit` / `Glob` / `Grep`) but runs inside an **incus guest VM**. Tool arguments travel as JSON over MCP, sidestepping the quoting/escaping pain of the built-in Bash tool for commands targeting the guest.
 
-## Development Commands
+Also emits `claude/channel` exit-event pushes so Claude learns about backgrounded task completions between turns.
 
-### Building
+## Architecture in one line
+
+Host `rbash-shim` ↔ unix socket (incus proxy device) ↔ in-guest `rbash-mcp` daemon. Claude sees a normal stdio MCP.
+
+## Layout
+
+- `cmd/rbash-mcp/` — in-guest daemon
+- `cmd/rbash-shim/` — host-side stdio↔socket bridge
+- `internal/tools/` — single Go package with all MCP tool handlers (bash family + file tools)
+- `internal/channels/` — Transport/Connection wrapper + Pusher for `notifications/claude/channel`
+- `deploy/` — systemd unit, incus profile example, install script
+- `PLAN.md` — v1 scope, decisions, build steps
+- `ROADMAP.md` — parked items (PTY, bash_stdin, regex/match/stall channel events, etc.)
+- `refs/` — local-only reference material, gitignored (extracted Claude Code source snippets + channels integration package)
+
+## Build
+
 ```bash
-go build -o claude-tools-mcp ./cmd/claude-tools-mcp
-```
-
-### Running Tests
-```bash
-# Run all tests
+go build -o bin/rbash-mcp ./cmd/rbash-mcp
+go build -o bin/rbash-shim ./cmd/rbash-shim
 go test ./...
-
-# Run tests for a specific package
-go test ./internal/tools
-
-# Run a specific test
-go test -run TestFunctionName ./internal/tools
 ```
 
-### Running the Server
-```bash
-# Default (localhost:8080)
-go run ./cmd/claude-tools-mcp
+## Upstream lineage
 
-# Custom address
-go run ./cmd/claude-tools-mcp --addr localhost:9000
+This repo is a GitHub fork of [`mathematic-inc/claude-tools-mcp`](https://github.com/mathematic-inc/claude-tools-mcp). The `upstream` git remote points there for future cherry-picks (e.g. file-tool bug fixes). Apache-2.0.
+
+## Launch flag
+
+For `claude/channel` exit pushes to land in Claude's context, the user must launch Claude Code with:
+
+```
+claude --dangerously-load-development-channels server:rbash
 ```
 
-## Releases
+Without the flag, tools work; pushes are silently dropped by Claude Code.
 
-The project uses [GoReleaser](https://goreleaser.com/) for automated releases.
+## Key decisions locked in
 
-### Creating a Release
+- Daemon runs as **root** inside the guest (guest is the trust boundary)
+- **Single-client** MCP — one Claude session at a time; second connection rejected
+- Socket path resolution: CLI arg → `$RBASH_SOCKET` → `$XDG_RUNTIME_DIR/rbash.sock` → `/run/rbash.sock`
+- Tool names capitalized to match Claude Code native (`Bash`, `BashOutput`, `KillShell`, `Read`, …) so model instincts transfer
+- Shell IDs: `bXXXXXXXX` (8 random alphanumeric), native format
+- Env injected into every spawn: `CLAUDECODE=1`, `SHELL=/bin/bash`, `GIT_EDITOR=true`
+- Output inline cap: 30 000 bytes (overridable via `BASH_MAX_OUTPUT_LENGTH` up to 150 000); past cap spills to `/var/lib/rbash/outputs/<task_id>.log`
+- Kill semantics: process-group SIGKILL (sets `Setpgid: true` on spawn)
 
-1. **Tag a version**: Create and push a git tag with semantic versioning:
-   ```bash
-   git tag -a v0.1.0 -m "Release v0.1.0"
-   git push origin v0.1.0
-   ```
+## Don't
 
-2. **Automated build**: GitHub Actions will automatically:
-   - Run tests
-   - Build binaries for multiple platforms (Linux, macOS, Windows on amd64/arm64)
-   - Create archives with checksums
-   - Generate changelog from commits
-   - Create a GitHub release with all artifacts
-
-### Local Testing
-
-Test the release configuration locally without publishing:
-```bash
-# Install goreleaser (if not already installed)
-go install github.com/goreleaser/goreleaser/v2@latest
-
-# Test release build (no publishing)
-goreleaser release --snapshot --clean
-
-# Check what would be released
-goreleaser check
-```
-
-### Release Artifacts
-
-Each release includes:
-- Pre-built binaries for Linux, macOS, and Windows (amd64 and arm64)
-- Compressed archives (tar.gz for Unix, zip for Windows)
-- SHA256 checksums for verification
-- Automatically generated changelog
-
-## Architecture
-
-### Core Components
-
-**cmd/claude-tools-mcp/main.go**: HTTP server entrypoint
-- Uses Cobra for CLI
-- Implements graceful shutdown with SIGINT/SIGTERM handling
-- Configures security timeouts (ReadHeaderTimeout, IdleTimeout) to prevent slowloris attacks
-- Runs MCP server in stateless mode via `mcp.NewStreamableHTTPHandler`
-
-**internal/tools/server.go**: Global state management
-- `State` struct manages file access tracking and background shells
-- Synchronized via `sync.RWMutex` for concurrent access
-- `ReadFiles` map tracks file modification times to detect external changes
-- `BackgroundShells` map manages long-running bash processes
-- Singleton instance via `GetState()`
-
-**Tool Implementations** (internal/tools/):
-- Each tool has its own file (bash.go, read.go, write.go, edit.go, glob.go, grep.go)
-- Tools follow MCP SDK patterns: define `Tool` schema and handler function
-- Handler signature: `func(ctx context.Context, req *sdk.CallToolRequest, args InputType) (*sdk.CallToolResult, any, error)`
-
-### Key Design Patterns
-
-**File Safety**:
-- `resolvePath()` rejects relative paths to prevent directory traversal
-- Edit tool requires files to be read first (tracked in `State.ReadFiles`)
-- Edit tool detects external modifications by comparing ModTime against last read
-- All file paths must be absolute
-
-**Output Size Constraints** (internal/tools/constraints.go):
-- Files: 10MB max (prevents memory exhaustion)
-- Tool output: ~100k tokens max (~400k chars, estimated at 4 chars/token)
-- Grep/glob results: 1000 lines max
-- Read tool: 2000 lines default, truncates lines >2000 chars
-
-**Background Shell Management**:
-- `BackgroundShell` struct tracks running processes with `Done` channel
-- `SyncBuffer` wraps `bytes.Buffer` with mutex for concurrent read/write
-- Output tracked with `LastStdoutReadAt`/`LastStderrReadAt` byte positions
-- Shell IDs generated sequentially: "shell_1", "shell_2", etc.
-
-**Line Number Formatting**:
-- `catN()` formats output like `cat -n` with dynamic column width
-- Format: `%6d→content` (minimum 6 chars for line numbers, arrow separator)
-- Used by read tool and edit tool context display
-
-**Edit Tool Context Display**:
-- `modifiedLines()` finds first/last differing lines between old/new content
-- Expands by `delta` lines (default 2) for context
-- Single edits show context snippet; `replace_all` edits show summary only
-
-**Grep Tool (Ripgrep Wrapper)**:
-- Three output modes: `files_with_matches` (default), `content`, `count`
-- Context flags (-A, -B, -C) and line numbers (-n) only apply in `content` mode
-- Multiline mode requires both `--multiline` and `--multiline-dotall` flags
-- Exit code 1 (no matches) treated as success with empty output
-
-## Testing Notes
-
-- Tests use `testify` for assertions
-- Each tool has its own `*_test.go` file
-- Tests create temporary files/directories for isolation
-- State is reset between tests via `NewState()`
+- Don't split `internal/tools/` into sub-packages. It's one Go package by design.
+- Don't import from `refs/` — it's research reference, not part of the build.
+- Don't push without explicit user confirmation.

@@ -1,0 +1,24 @@
+# Incus profile stub for rbash-mcp.
+#
+# Attach this profile (or merge its devices into an existing one) to the
+# guest that runs the rbash-mcp daemon. The proxy device forwards a
+# host-side unix socket at /run/rbash.sock into the guest's
+# /run/rbash.sock where the daemon listens.
+#
+# Usage:
+#   incus profile create rbash
+#   incus profile edit rbash < deploy/incus/profile.yaml.example
+#   incus profile add <guest> rbash
+
+name: rbash
+description: rbash-mcp socket bridge
+devices:
+  rbash-sock:
+    type: proxy
+    listen: unix:/run/rbash.sock
+    connect: unix:/run/rbash.sock
+    # uid/gid 0 on both sides — daemon runs as root in the guest by
+    # design; host-side socket owner is root-only (0600).
+    uid: "0"
+    gid: "0"
+    mode: "0600"

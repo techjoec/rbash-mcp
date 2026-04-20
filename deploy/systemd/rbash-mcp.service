@@ -1,0 +1,15 @@
+[Unit]
+Description=rbash-mcp — MCP bash server for Claude Code
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/rbash-mcp
+Restart=on-failure
+RestartSec=2
+# Daemon runs as root by design — simplifies uid/gid handling inside the
+# incus guest, which is the trust boundary.
+User=root
+
+[Install]
+WantedBy=multi-user.target

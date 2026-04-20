@@ -17,3 +17,7 @@ go.work.sum
 # Dependency directories
 vendor/
 node_modules/
+
+# Local-only reference material (not part of distribution).
+# The upstream source is available via `git fetch upstream` since we're a fork.
+/refs/
