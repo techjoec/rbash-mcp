@@ -29,7 +29,19 @@ Host `rbash-shim` ↔ unix socket (incus proxy device) ↔ in-guest `rbash-mcp` 
 go build -o bin/rbash-mcp ./cmd/rbash-mcp
 go build -o bin/rbash-shim ./cmd/rbash-shim
 go test ./...
+golangci-lint run
 ```
+
+## Dev loop (iterate against a running guest)
+
+```bash
+go build -o bin/rbash-mcp ./cmd/rbash-mcp
+incus file push bin/rbash-mcp <guest>/usr/local/bin/rbash-mcp
+incus exec <guest> -- systemctl restart rbash-mcp
+incus exec <guest> -- journalctl -u rbash-mcp -n 50 --no-pager
+```
+
+Daemon logs via `log/slog` to stderr, captured by systemd → `journalctl -u rbash-mcp`.
 
 ## Upstream lineage
 
@@ -58,6 +70,6 @@ Without the flag, tools work; pushes are silently dropped by Claude Code.
 
 ## Don't
 
-- Don't split `internal/tools/` into sub-packages. It's one Go package by design.
+- Don't split `internal/tools/` into sub-packages. It's one Go package by design. (Per-tool `_test.go` files are fine — that's the existing pattern.)
 - Don't import from `refs/` — it's research reference, not part of the build.
 - Don't push without explicit user confirmation.
